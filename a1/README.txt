@@ -9,3 +9,4 @@ conda install gensim
 Homework 1 (only) is a Jupyter Notebook. With the above done you should be able to get underway by typing:
 
 jupyter notebook exploring_word_vectors.ipynb
+
