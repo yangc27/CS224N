@@ -244,17 +244,20 @@ class CoAttention(nn.Module):
         s = s0 + s1 + s2 + self.bias
         return s
 
-class Fuse:
+class Fuse(nn.Module):
     def __init__(self, hid_size):
+        super(Fuse, self).__init__()
         self.linear = nn.Linear(4 * hid_size, hid_size) # used to generate m
         self.gate = nn.Linear(4 * hid_size, hid_size)
+        self.tanh = nn.Tanh()
+        self.sigmoid = nn.Sigmoid()
 
     def fuse(self, a, b):
         # a is the original representation, size (bs, seq_len, hid_size)
         # b is the co-attention aware representation, size (bs, seq_len, hid_size)
         x = torch.cat([a, b, a * b, a - b], dim = 2)   # (bs, seq_len, 4 * hid_size)
-        m = torch.tanh(self.linear(x.cuda()))                 # (bs, seq_len, hid_size)
-        g = torch.sigmoid(self.gate(x))                # (bs, seq_len, hid_size)
+        m = self.tanh(self.linear(x))                 # (bs, seq_len, hid_size)
+        g = self.sigmoid(self.gate(x))                # (bs, seq_len, hid_size)
         output = g * m + (1 - g) * a                   # (bs, seq_len, hid_size)
         return output
 
