@@ -253,7 +253,7 @@ class Fuse:
         # a is the original representation, size (bs, seq_len, hid_size)
         # b is the co-attention aware representation, size (bs, seq_len, hid_size)
         x = torch.cat([a, b, a * b, a - b], dim = 2)   # (bs, seq_len, 4 * hid_size)
-        m = torch.tanh(self.linear(x))                 # (bs, seq_len, hid_size)
+        m = torch.tanh(self.linear(x.cuda()))                 # (bs, seq_len, hid_size)
         g = torch.sigmoid(self.gate(x))                # (bs, seq_len, hid_size)
         output = g * m + (1 - g) * a                   # (bs, seq_len, hid_size)
         return output
@@ -334,8 +334,7 @@ class SelfAttention(nn.Module):
         self.rnn3 = RNNEncoder(input_size=2 * hidden_size,
                               hidden_size=hidden_size,
                               num_layers=1,
-                              drop_prob=drop_prob)                                         
-
+                              drop_prob=drop_prob)
 
     def forward(self, c_coatt, q_coatt, c_len, q_len):
         # for context
