@@ -1,0 +1,15 @@
+.DS_Store
+.idea/
+__pycache__
+.texpadtmp/
+data/
+save/
+bin/
+lib/
+pyvenv.cfg
+*.whl
+*.pyc
+lib64
+pip-selfcheck.json
+bert_output/
+.vscode

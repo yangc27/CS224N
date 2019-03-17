@@ -176,12 +176,106 @@ class BiDAFAttention(nn.Module):
         # Shapes: (batch_size, c_len, q_len)
         s0 = torch.matmul(c, self.c_weight).expand([-1, -1, q_len])
         s1 = torch.matmul(q, self.q_weight).transpose(1, 2)\
-                                           .expand([-1, c_len, -1])
+                                        .expand([-1, c_len, -1])
         s2 = torch.matmul(c * self.cq_weight, q.transpose(1, 2))
         s = s0 + s1 + s2 + self.bias
-
         return s
 
+class CoAttention(nn.Module):
+    """Co-attention layer in the Hierachical Attention (HA) Fusion Network paper
+    """
+
+    def __init__(self, hidden_size, drop_prob = 0.1):
+        super(CoAttention, self).__init__()
+        self.drop_prob = drop_prob
+        self.c_weight = nn.Parameter(torch.zeros(hidden_size, 1))
+        self.q_weight = nn.Parameter(torch.zeros(hidden_size, 1))
+        self.cq_weight = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        for weight in (self.c_weight, self.q_weight, self.cq_weight):
+            nn.init.xavier_uniform_(weight)
+        self.bias = nn.Parameter(torch.zeros(1))
+
+        # used in HAFN below
+        self.fuse_ca = Fuse(hidden_size)
+        self.fuse_qb = Fuse(hidden_size)
+
+    def forward(self, c, q, c_mask, q_mask):
+        batch_size, c_len, _ = c.size()             # c - (batch_size, c_len, hid_size)
+        q_len = q.size(1)                           # q - (batch_size, q_len, hid_size)
+        s = self.get_similarity_matrix(c, q)        # (batch_size, c_len, q_len)
+        c_mask = c_mask.view(batch_size, c_len, 1)  # (batch_size, c_len, 1)
+        q_mask = q_mask.view(batch_size, 1, q_len)  # (batch_size, 1, q_len)
+        s1 = masked_softmax(s, q_mask, dim=2)       # (batch_size, c_len, q_len)
+        s2 = masked_softmax(s, c_mask, dim=1)       # (batch_size, c_len, q_len)
+
+        # (bs, c_len, q_len) x (bs, q_len, hid_size) => (bs, c_len, hid_size)
+        a = torch.bmm(s1, q)
+        # (bs, c_len, c_len) x (bs, c_len, hid_size) => (bs, c_len, hid_size)
+        b = torch.bmm(s2.transpose(1, 2), c)
+
+        # fuse c and a
+        c_coatt = self.fuse_ca.fuse(c, a)           # (batch_size, c_len, hid_size)
+
+        # fuse q and b
+        q_coatt = self.fuse_qb.fuse(q, b)           # (batch_size, q_len, hid_size)
+
+        return c_coatt, q_coatt
+
+    def get_similarity_matrix(self, c, q):
+        """Get the "similarity matrix" between context and query (using the
+        terminology of the BiDAF paper).
+
+        A naive implementation as described in BiDAF would concatenate the
+        three vectors then project the result with a single weight matrix. This
+        method is a more memory-efficient implementation of the same operation.
+
+        See Also:
+            Equation 1 in https://arxiv.org/abs/1611.01603
+        """
+        c_len, q_len = c.size(1), q.size(1)
+        c = F.dropout(c, self.drop_prob, self.training)  # (bs, c_len, hid_size)
+        q = F.dropout(q, self.drop_prob, self.training)  # (bs, q_len, hid_size)
+
+        # Shapes: (batch_size, c_len, q_len)
+        s0 = torch.matmul(c, self.c_weight).expand([-1, -1, q_len])
+        s1 = torch.matmul(q, self.q_weight).transpose(1, 2)\
+                                        .expand([-1, c_len, -1])
+        s2 = torch.matmul(c * self.cq_weight, q.transpose(1, 2))
+        s = s0 + s1 + s2 + self.bias
+        return s
+
+class Fuse:
+    def __init__(self, hid_size):
+        self.linear = nn.Linear(4 * hid_size, hid_size) # used to generate m
+        self.gate = nn.Linear(4 * hid_size, hid_size)
+
+    def fuse(self, a, b):
+        # a is the original representation, size (bs, seq_len, hid_size)
+        # b is the co-attention aware representation, size (bs, seq_len, hid_size)
+        x = torch.cat([a, b, a * b, a - b], dim = 2)   # (bs, seq_len, 4 * hid_size)
+        m = torch.tanh(self.linear(x))                 # (bs, seq_len, hid_size)
+        g = torch.sigmoid(self.gate(x))                # (bs, seq_len, hid_size)
+        output = g * m + (1 - g) * a                   # (bs, seq_len, hid_size)
+        return output
+
+class HAOutput(nn.Module):
+    def __init__(self, hidden_size):
+        super(HAOutput, self).__init__()
+        self.Ws = nn.Parameter(torch.zeros(hidden_size, hidden_size))
+        self.We = nn.Parameter(torch.zeros(hidden_size, hidden_size))
+        nn.init.xavier_uniform_(self.Ws)
+        nn.init.xavier_uniform_(self.We)
+
+    def forward(self, q, D, mask):
+        # match for Pstart
+        ms = torch.matmul(torch.matmul(q, self.Ws), D.permute(0, 2, 1))             # (bs, 1, c_len)
+        log_p1 = masked_softmax(ms.squeeze(), mask, log_softmax=True)
+
+        # match for Pend
+        me = torch.matmul(torch.matmul(q, self.We), D.permute(0, 2, 1))             # (bs, 1, c_len)
+        log_p2 = masked_softmax(me.squeeze(), mask, log_softmax=True)
+
+        return log_p1, log_p2
 
 class BiDAFOutput(nn.Module):
     """Output layer used by BiDAF for question answering.
@@ -220,3 +314,40 @@ class BiDAFOutput(nn.Module):
         log_p2 = masked_softmax(logits_2.squeeze(), mask, log_softmax=True)
 
         return log_p1, log_p2
+
+class SelfAttention(nn.Module):
+    """Co-attention layer in the Hierachical Attention (HA) Fusion Network paper
+    """
+    def __init__(self, input_size, hidden_size, drop_prob = 0.): 
+        super(SelfAttention, self).__init__()
+        self.rnn1 = RNNEncoder(input_size=input_size,
+                              hidden_size=hidden_size,
+                              num_layers=1,
+                              drop_prob=drop_prob)
+        self.W1 = nn.Parameter(torch.zeros(2 * hidden_size, 2 * hidden_size))
+        nn.init.xavier_uniform_(self.W1)
+        self.fuse = Fuse(2 * hidden_size)
+        self.rnn2 = RNNEncoder(input_size=2 * hidden_size,
+                              hidden_size=hidden_size,
+                              num_layers=1,
+                              drop_prob=drop_prob)
+        self.rnn3 = RNNEncoder(input_size=2 * hidden_size,
+                              hidden_size=hidden_size,
+                              num_layers=1,
+                              drop_prob=drop_prob)                                         
+
+
+    def forward(self, c_coatt, q_coatt, c_len, q_len):
+        # for context
+        d = self.rnn1(c_coatt, c_len)                                          # (bs, c_len, 2 * hidden_size)
+        dt = d.permute(0, 2, 1)                                                # (bs, 2 * hidden_size, c_len)
+        L = torch.softmax(torch.matmul(torch.matmul(d, self.W1), dt), 2)       # (bs, c_len, c_len)
+        d1 = torch.matmul(L, d)                                                # (bs, c_len, 2 * hidden_size)
+        d2 = self.fuse.fuse(d, d1)                                             # (bs, c_len, 2 * hidden_size)
+        D_final = self.rnn2(d2, c_len)                                         # (bs, c_len, 2 * hidden_size)
+
+        # for question
+        Q_rnn = self.rnn3(q_coatt, q_len)                         # (bs, q_len, 2 * hidden_size)
+        q_final = Q_rnn.sum(1).unsqueeze(1)                       # (bs, 1, 2 * hidden_size)
+
+        return q_final, D_final
